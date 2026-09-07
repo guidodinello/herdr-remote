@@ -666,7 +666,11 @@ async def _poll_once():
                 )
                 previous = last_blocked_prompts.get(pid)
                 if previous != fingerprint:
-                    message["update"] = previous is not None and previous[0] == message["prompt_id"]
+                    # A blocked pane whose TUI animates (spinners, elapsed timers) produces a
+                    # fresh prompt_id every poll, which used to read as a brand-new prompt and
+                    # fire a new downstream notification each time. Treat any re-broadcast for a
+                    # pane that is still in the same blocked streak as an update, not a new block.
+                    message["update"] = previous is not None
                     last_blocked_prompts[pid] = fingerprint
                     await broadcast(message)
                     await send_web_push(
