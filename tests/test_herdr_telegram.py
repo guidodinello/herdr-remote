@@ -3,6 +3,7 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -90,6 +91,94 @@ class TelegramQuestionTests(unittest.TestCase):
         )
         self.assertIn("web terminal or manual terminal controls", bot.sent[0]["text"])
         self.assertEqual(telegram.pending[(1, 42)], "pane-1")
+
+
+class _Message:
+    def __init__(self, text):
+        self.text = text
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append(text)
+
+
+def _command(text, chat_id=1):
+    message = _Message(text)
+    update = types.SimpleNamespace(message=message, effective_chat=types.SimpleNamespace(id=chat_id))
+    ctx = types.SimpleNamespace(args=text.split()[1:])
+    return update, ctx, message
+
+
+class TelegramSpawnCommandTests(unittest.TestCase):
+    """The opt-in HERDR_TG_SPAWN_CMD hook behind /run <alias> and /start <alias>."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.argv_log = self.tmp / "argv"
+        self.telegram = loaded_telegram()
+        self.telegram.CHAT_ID = "1"
+
+    def _spawn_cmd(self, body):
+        script = self.tmp / "spawn.sh"
+        script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{self.argv_log}"\n{body}\n')
+        script.chmod(0o755)
+        self.telegram.SPAWN_CMD = str(script)
+
+    def _argv(self):
+        return self.argv_log.read_text().splitlines() if self.argv_log.exists() else None
+
+    def test_run_passes_chat_and_command_as_argv_and_replies_with_stdout(self):
+        self._spawn_cmd('echo "Started nightly in w1:p2"')
+        update, ctx, message = _command("/run nightly")
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertEqual(self._argv(), ["--chat-id", "1", "--text", "/run nightly"])
+        self.assertEqual(message.replies, ["Started nightly in w1:p2"])
+
+    def test_bot_name_suffix_is_dropped_before_the_command(self):
+        self._spawn_cmd("echo ok")
+        update, ctx, _ = _command("/run@herdr_bot nightly")
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertEqual(self._argv()[-1], "/run nightly")
+
+    def test_start_with_an_alias_spawns(self):
+        self._spawn_cmd("echo ok")
+        update, ctx, _ = _command("/start nightly")
+
+        asyncio.run(self.telegram.cmd_start(update, ctx))
+
+        self.assertEqual(self._argv()[-1], "/start nightly")
+
+    def test_bare_start_still_shows_the_dashboard(self):
+        self._spawn_cmd("echo ok")
+        update, ctx, message = _command("/start")
+
+        asyncio.run(self.telegram.cmd_start(update, ctx))
+
+        self.assertIsNone(self._argv(), "bare /start must not run the spawn command")
+        self.assertEqual(len(message.replies), 1)
+
+    def test_failed_command_without_output_reports_its_stderr(self):
+        self._spawn_cmd('echo "telegram_spawn is not configured" >&2; exit 1')
+        update, ctx, message = _command("/run nightly")
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertEqual(message.replies, ["Spawn failed (exit 1): telegram_spawn is not configured"])
+
+    def test_unauthorized_chat_never_runs_the_command(self):
+        self._spawn_cmd("echo ok")
+        update, ctx, message = _command("/run nightly", chat_id=2)
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertIsNone(self._argv())
+        self.assertEqual(message.replies, [])
 
 
 if __name__ == "__main__":

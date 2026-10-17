@@ -124,8 +124,11 @@ uv run relay/herdr_telegram.py
 | `/trust` | Trust all tools for blocked agent |
 | `/interrupt` | Send Ctrl+C |
 | `/digest` | Today's activity summary |
+| `/run <alias>` | Cold-start a session (only when `HERDR_TG_SPAWN_CMD` is set) |
 
 The `/start`, `/read`, `/reply`, `/send`, `/interrupt`, and `/trust` pickers keep every eligible agent reachable. Normal herds appear in one list; larger herds include Previous and Next buttons. Selecting an agent opens a reply prompt containing its recent output; reply to that prompt to send text safely to the pane.
+
+**Cold-start hook (optional).** Set `HERDR_TG_SPAWN_CMD` to an executable and the bot runs it once per `/run <args>` or `/start <args>` as `<cmd> --chat-id <id> --text "/run <args>"`, without a shell, and replies with its stdout. A bare `/start` still shows the dashboard. The command does its own allowlisting; the bot only forwards messages from `HERDR_TG_CHAT_ID`. [herdr-routines](https://github.com/guidodinello/herdr-routines) ships `scripts/herdr-spawn-from-telegram.sh` for this.
 
 Finished and blocked notifications include **Open output & reply**. You can also reply directly to the notification to send a follow-up without returning to the agent list. Blocked notifications retain their one-tap approval controls.
 
