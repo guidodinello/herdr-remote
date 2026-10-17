@@ -4,7 +4,7 @@
 # dependencies = ["python-telegram-bot>=21.0", "websockets>=14.0"]
 # ///
 """herdr-remote Telegram bot — monitor and approve agents from Telegram."""
-import asyncio, hashlib, json, os, logging, secrets
+import asyncio, hashlib, json, os, logging, re, secrets
 from collections import Counter, OrderedDict
 
 from telegram import ForceReply, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -59,6 +59,9 @@ COMMAND_ACK_TIMEOUT = 20
 # Covers the spawn command's own 120s agent-start timeout plus worktree creation.
 SPAWN_TIMEOUT = 180
 SPAWN_ERROR_TAIL = 500
+# herdr-routines' success reply: "Spawned <name> on <where>, pane <id>. Reply to this
+# message to steer it." The pane id is what makes that reply steerable.
+SPAWNED_PANE_RE = re.compile(r", pane ([A-Za-z0-9:_-]+)\. Reply to this message")
 PANE_READ_TIMEOUT = 20
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
 STATUS_LABELS = {"blocked": "BLOCKED", "working": "WORKING", "done": "DONE", "idle": "IDLE", "unknown": "IDLE"}
@@ -407,7 +410,9 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply = await run_spawn_command(update.effective_chat.id, text)
     except OSError as e:
         reply = f"Spawn failed: {e}"
-    await update.message.reply_text(scrub(reply))
+    sent = await update.message.reply_text(scrub(reply))
+    if match := SPAWNED_PANE_RE.search(reply):
+        register_pending(update.effective_chat.id, sent.message_id, match.group(1))
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
