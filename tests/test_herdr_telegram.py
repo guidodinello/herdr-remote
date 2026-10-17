@@ -100,6 +100,7 @@ class _Message:
 
     async def reply_text(self, text, **kwargs):
         self.replies.append(text)
+        return types.SimpleNamespace(message_id=100 + len(self.replies))
 
 
 def _command(text, chat_id=1):
@@ -137,6 +138,25 @@ class TelegramSpawnCommandTests(unittest.TestCase):
 
         self.assertEqual(self._argv(), ["--chat-id", "1", "--text", "/run nightly"])
         self.assertEqual(message.replies, ["Started nightly in w1:p2"])
+
+    def test_spawn_reply_is_steerable_by_replying_to_it(self):
+        self._spawn_cmd(
+            'echo "Spawned rt-routines-1 on branch auto/spawn-routines-1 (worktree /w), '
+            'pane w80:p1. Reply to this message to steer it."'
+        )
+        update, ctx, message = _command("/run routines")
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertEqual(self.telegram.pending_pane(1, 101), "w80:p1")
+
+    def test_failed_spawn_reply_is_not_steerable(self):
+        self._spawn_cmd('echo "spawn failed: no pane"')
+        update, ctx, _ = _command("/run routines")
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertIsNone(self.telegram.pending_pane(1, 101))
 
     def test_bot_name_suffix_is_dropped_before_the_command(self):
         self._spawn_cmd("echo ok")
