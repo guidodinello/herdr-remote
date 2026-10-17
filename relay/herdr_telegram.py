@@ -20,6 +20,10 @@ log = logging.getLogger("herdr-tg")
 TOKEN = os.environ.get("HERDR_TG_TOKEN", "")
 CHAT_ID = os.environ.get("HERDR_TG_CHAT_ID", "")
 RELAY_WS = os.environ.get("HERDR_RELAY", "ws://127.0.0.1:8375")
+# Optional cold-start hook: an executable run once per `/run <args>` or `/start <args>`
+# as `<cmd> --chat-id <id> --text "/<verb> <args>"`; its stdout is the chat reply.
+# Unset = no /run command and /start stays the dashboard.
+SPAWN_CMD = os.environ.get("HERDR_TG_SPAWN_CMD", "")
 RELAY_WS_SAFE = RELAY_WS.split("?", 1)[0]  # token-free variant for display and logging; never leak the token
 _RELAY_TOKEN = RELAY_WS.split("token=", 1)[1] if "token=" in RELAY_WS else ""
 
@@ -52,6 +56,9 @@ daily_stats: dict[str, dict] = {}  # pane_id -> {agent, project, blocked_count, 
 AGENT_PAGE_SIZE = 20
 PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
+# Covers the spawn command's own 120s agent-start timeout plus worktree creation.
+SPAWN_TIMEOUT = 180
+SPAWN_ERROR_TAIL = 500
 PANE_READ_TIMEOUT = 20
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
 STATUS_LABELS = {"blocked": "BLOCKED", "working": "WORKING", "done": "DONE", "idle": "IDLE", "unknown": "IDLE"}
@@ -366,11 +373,49 @@ def dashboard_text() -> str:
     return text
 
 
+async def run_spawn_command(chat_id: int, text: str) -> str:
+    """Run SPAWN_CMD for one cold-start message and return the reply to send back.
+
+    The message reaches the command only as argv, never through a shell."""
+    proc = await asyncio.create_subprocess_exec(
+        SPAWN_CMD, "--chat-id", str(chat_id), "--text", text,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), SPAWN_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return f"Spawn timed out after {SPAWN_TIMEOUT}s."
+    reply = out.decode(errors="replace").strip()
+    if proc.returncode != 0 and not reply:
+        tail = err.decode(errors="replace").strip()[-SPAWN_ERROR_TAIL:]
+        return f"Spawn failed (exit {proc.returncode}): {tail}"
+    return reply or "Nothing to spawn: send /run <alias>."
+
+
 # --- Bot commands ---
+
+async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /run <alias> (and /start <alias>): cold-start a session via SPAWN_CMD."""
+    if not authorized(update):
+        return
+    verb = "start" if update.message.text.lstrip("/").startswith("start") else "run"
+    # Rebuilt from the parsed args so a `/run@bot_name` suffix never reaches the command.
+    text = " ".join([f"/{verb}", *ctx.args])
+    try:
+        reply = await run_spawn_command(update.effective_chat.id, text)
+    except OSError as e:
+        reply = f"Spawn failed: {e}"
+    await update.message.reply_text(scrub(reply))
+
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     if not authorized(update):
+        return
+    if SPAWN_CMD and ctx.args:
+        await cmd_run(update, ctx)
         return
     text = dashboard_text()
     if not CHAT_ID:
@@ -1012,6 +1057,9 @@ def main():
         auth_filter = filters.ALL  # No restriction in discovery mode
 
     app.add_handler(CommandHandler("start", cmd_start, filters=auth_filter))
+    if SPAWN_CMD:
+        # block=False: a spawn can take minutes, and approval taps must not queue behind it.
+        app.add_handler(CommandHandler("run", cmd_run, filters=auth_filter, block=False))
     app.add_handler(CommandHandler("agents", cmd_agents, filters=auth_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=auth_filter))
     app.add_handler(CommandHandler("read", cmd_read, filters=auth_filter))

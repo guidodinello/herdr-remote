@@ -8,6 +8,8 @@ working tree**, kept checked out on the deploy branch **`pi-deploy`**.
                 whose TUI is animating"  ->  submitted upstream as
                 https://github.com/dcolinmorgan/herdr-remote/pull/65
               + this DEPLOY-NOTE.md
+              + "feat(telegram): optional /run cold-start hook" (HERDR_TG_SPAWN_CMD),
+                fork-only: wires /run <alias> to herdr-routines' spawn-from-telegram
 
 `main` tracks upstream (`dcolinmorgan/herdr-remote` via `upstream`, mirrored to
 `origin` = `guidodinello/herdr-remote`).
