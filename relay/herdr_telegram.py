@@ -56,6 +56,9 @@ daily_stats: dict[str, dict] = {}  # pane_id -> {agent, project, blocked_count, 
 AGENT_PAGE_SIZE = 20
 PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
+# python-telegram-bot's 5s default connect timeout includes the DNS lookup, and glibc
+# waits 5s before retrying a dropped DNS query, so one lost query fails a send outright.
+TELEGRAM_CONNECT_TIMEOUT = 15
 # Covers the spawn command's own 120s agent-start timeout plus worktree creation.
 SPAWN_TIMEOUT = 180
 SPAWN_ERROR_TAIL = 500
@@ -1055,7 +1058,13 @@ async def relay_listener(app: Application):
 # --- Main ---
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+        .get_updates_connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+        .build()
+    )
     if CHAT_ID:
         auth_filter = filters.Chat(chat_id=int(CHAT_ID))
     else:
