@@ -191,6 +191,23 @@ class TelegramSpawnCommandTests(unittest.TestCase):
 
         self.assertEqual(message.replies, ["Spawn failed (exit 1): telegram_spawn is not configured"])
 
+    def test_job_verb_is_forwarded_as_job(self):
+        self._spawn_cmd('echo "Started fitted-pr-review (request)."')
+        update, ctx, message = _command("/job@herdr_bot fitted-pr-review")
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertEqual(self._argv(), ["--chat-id", "1", "--text", "/job fitted-pr-review"])
+        self.assertEqual(message.replies, ["Started fitted-pr-review (request)."])
+
+    def test_unauthorized_chat_never_runs_a_job(self):
+        self._spawn_cmd("echo ok")
+        update, ctx, _ = _command("/job fitted-pr-review", chat_id=2)
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertIsNone(self._argv())
+
     def test_unauthorized_chat_never_runs_the_command(self):
         self._spawn_cmd("echo ok")
         update, ctx, message = _command("/run nightly", chat_id=2)
