@@ -24,6 +24,8 @@ RELAY_WS = os.environ.get("HERDR_RELAY", "ws://127.0.0.1:8375")
 # as `<cmd> --chat-id <id> --text "/<verb> <args>"`; its stdout is the chat reply.
 # Unset = no /run command and /start stays the dashboard.
 SPAWN_CMD = os.environ.get("HERDR_TG_SPAWN_CMD", "")
+# Verbs forwarded to SPAWN_CMD as `/<verb> <args>`; anything else is treated as /run.
+SPAWN_VERBS = frozenset({"run", "start", "job"})
 RELAY_WS_SAFE = RELAY_WS.split("?", 1)[0]  # token-free variant for display and logging; never leak the token
 _RELAY_TOKEN = RELAY_WS.split("token=", 1)[1] if "token=" in RELAY_WS else ""
 
@@ -403,10 +405,15 @@ async def run_spawn_command(chat_id: int, text: str) -> str:
 # --- Bot commands ---
 
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /run <alias> (and /start <alias>): cold-start a session via SPAWN_CMD."""
+    """Handle /run <alias> (and /start <alias>): cold-start a session via SPAWN_CMD.
+
+    Also /job <name>: herdr-routines runs a `request: true` job through its scheduled
+    path (herdr-routines issue 075). SPAWN_CMD decides what each verb does."""
     if not authorized(update):
         return
-    verb = "start" if update.message.text.lstrip("/").startswith("start") else "run"
+    verb = update.message.text.split()[0].lstrip("/").split("@")[0]
+    if verb not in SPAWN_VERBS:
+        verb = "run"
     # Rebuilt from the parsed args so a `/run@bot_name` suffix never reaches the command.
     text = " ".join([f"/{verb}", *ctx.args])
     try:
@@ -1074,6 +1081,7 @@ def main():
     if SPAWN_CMD:
         # block=False: a spawn can take minutes, and approval taps must not queue behind it.
         app.add_handler(CommandHandler("run", cmd_run, filters=auth_filter, block=False))
+        app.add_handler(CommandHandler("job", cmd_run, filters=auth_filter, block=False))
     app.add_handler(CommandHandler("agents", cmd_agents, filters=auth_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=auth_filter))
     app.add_handler(CommandHandler("read", cmd_read, filters=auth_filter))
