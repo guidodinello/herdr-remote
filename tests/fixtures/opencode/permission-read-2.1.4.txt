@@ -1,0 +1,20 @@
+
+  ┃
+  ┃  Use the read tool to read a.txt and tell me its content.
+  ┃
+
+     I'll read the file for you.
+
+     ⠙ Read a.txt
+
+  ┃
+  ┃  △ Permission required
+  ┃    → Read a.txt
+  ┃
+  ┃  Path: a.txt
+  ┃
+  ┃
+  ┃   Allow once   Always allow   Reject
+  ┃
+  ┃  ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃

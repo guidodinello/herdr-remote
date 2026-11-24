@@ -1,0 +1,22 @@
+
+  ┃
+  ┃  Use the bash tool to run: cat c.txt
+  ┃
+
+     + Thought: 133ms
+
+     $ cat c.txt
+
+     ▣  Build · Big Pickle
+
+  ┃
+  ┃  △ Permission required
+  ┃    # Shell command
+  ┃
+  ┃  $ cat c.txt
+  ┃
+  ┃
+  ┃   Allow once   Allow always   Reject
+  ┃
+  ┃  ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃

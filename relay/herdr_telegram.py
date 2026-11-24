@@ -7,7 +7,7 @@
 import asyncio, hashlib, json, os, logging, re, secrets
 from collections import Counter, OrderedDict
 
-from telegram import ForceReply, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import BotCommand, ForceReply, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
 
 from agent_state import apply_agent_message
@@ -414,8 +414,12 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     verb = update.message.text.split()[0].lstrip("/").split("@")[0]
     if verb not in SPAWN_VERBS:
         verb = "run"
-    # Rebuilt from the parsed args so a `/run@bot_name` suffix never reaches the command.
-    text = " ".join([f"/{verb}", *ctx.args])
+    # The verb is rebuilt so a `/run@bot_name` suffix never reaches the command. The rest
+    # of the message is kept as typed: the lines after the command are the agent's first
+    # prompt, and ctx.args would flatten them into one line.
+    parts = update.message.text.split(None, 1)
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    text = f"/{verb} {rest}" if rest else f"/{verb}"
     try:
         reply = await run_spawn_command(update.effective_chat.id, text)
     except OSError as e:
@@ -439,6 +443,59 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=build_agent_keyboard("select_reply"))
         return
     await update.message.reply_text(text)
+
+
+HELP_TEXT = """Replying
+- Reply to any bot message about an agent to send it text.
+- Blocked agents get approval buttons. For opencode permission prompts you can also reply \
+"allow once", "allow always" or "reject" (or once / always / no).
+- /agents or /reply opens a picker; choose an agent to see its output and reply.
+
+Commands
+/agents - list agents and pick one
+/reply [name] - show an agent's output and reply
+/send <name> <text> - send text to an agent
+/read [name] - recent terminal output
+/esc [name] - interrupt an agent (Ctrl+C)
+/trust [name] - always-allow a blocked agent's prompt
+/status - relay connection
+/digest - today's activity"""
+
+SPAWN_HELP = """
+
+Starting agents
+/run <alias> [harness] [model] - start a new agent
+  Put a first prompt on the next lines, or after -- on the same line:
+  /run myrepo opencode -- review the auth module
+/job <name> - run a configured job"""
+
+
+def bot_commands() -> list[BotCommand]:
+    commands = [
+        BotCommand("agents", "List agents and pick one"),
+        BotCommand("reply", "Read an agent's output and reply"),
+        BotCommand("send", "Send text to an agent"),
+        BotCommand("read", "Recent terminal output"),
+        BotCommand("esc", "Interrupt an agent"),
+        BotCommand("trust", "Always-allow a blocked agent"),
+    ]
+    if SPAWN_CMD:
+        commands += [
+            BotCommand("run", "Start an agent, optionally with a prompt"),
+            BotCommand("job", "Run a configured job"),
+        ]
+    return commands + [
+        BotCommand("status", "Relay connection"),
+        BotCommand("digest", "Today's activity"),
+        BotCommand("help", "How replies work"),
+    ]
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /help — how replies and commands work."""
+    if not authorized(update):
+        return
+    await update.message.reply_text(HELP_TEXT + (SPAWN_HELP if SPAWN_CMD else ""))
 
 
 async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -474,7 +531,8 @@ async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
             lines.append(f"  {a['project']} ({a['agent']}){host}")
 
-    await update.message.reply_text("\n".join(lines))
+    lines.extend(["", "Pick an agent to read its output and reply."])
+    await update.message.reply_text("\n".join(lines), reply_markup=build_agent_keyboard("select_reply"))
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -859,6 +917,11 @@ SUBAGENT_BUTTONS = [
 ]
 
 
+# Prompts answered by sending the option's label: the relay turns it into the right input
+# (an omp question's selection, or the arrow keys that pick an opencode permission option).
+LABEL_INTERACTIONS = frozenset({"omp_question", "opencode_permission"})
+
+
 def make_keyboard(
     pane_id: str,
     options: list[str] | None,
@@ -867,7 +930,7 @@ def make_keyboard(
 ) -> InlineKeyboardMarkup:
     if not options:
         return interaction_keyboard(pane_id)
-    if interaction == "omp_question":
+    if interaction in LABEL_INTERACTIONS:
         buttons = [(opt, opt) for opt in options]
     elif "trust" in " ".join(options).lower():
         buttons = TOOL_BUTTONS
@@ -877,7 +940,7 @@ def make_keyboard(
         buttons = [(opt.split(",")[0], opt) for opt in options]
 
     generation = generation or secrets.token_hex(4)
-    if interaction == "omp_question":
+    if interaction in LABEL_INTERACTIONS:
         keyboard = [
             [InlineKeyboardButton(label, callback_data=pane_callback_data(
                 "approval", pane_id, g=generation, i=str(i),
@@ -1089,7 +1152,8 @@ def main():
     app.add_handler(CommandHandler("send", cmd_send, filters=auth_filter))
     app.add_handler(CommandHandler("trust", cmd_trust, filters=auth_filter))
     app.add_handler(CommandHandler("digest", cmd_digest, filters=auth_filter))
-    app.add_handler(CommandHandler("interrupt", cmd_interrupt, filters=auth_filter))
+    app.add_handler(CommandHandler(["interrupt", "esc"], cmd_interrupt, filters=auth_filter))
+    app.add_handler(CommandHandler("help", cmd_help, filters=auth_filter))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & auth_filter, handle_text))
 
@@ -1099,6 +1163,12 @@ def main():
     async def run():
         async with app:
             await app.start()
+            try:
+                # Keep Telegram's command menu in step with the handlers above, so it never
+                # offers a command this bot does not answer.
+                await app.bot.set_my_commands(bot_commands())
+            except Exception as e:
+                log.warning("Failed to set the command menu: %s", scrub(e))
             await app.updater.start_polling()
             await relay_listener(app)
 

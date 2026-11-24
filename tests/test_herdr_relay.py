@@ -1327,6 +1327,96 @@ class RelayResponseTests(unittest.TestCase):
 
 
 
+OPENCODE_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "opencode"
+
+
+def opencode_screen(name):
+    """A real `herdr pane read --source visible` capture of an opencode dialog."""
+    return (OPENCODE_FIXTURES / f"{name}.txt").read_text(encoding="utf-8")
+
+
+class RelayOpencodePermissionTests(unittest.TestCase):
+    def setUp(self):
+        context = loaded_relay()
+        self.relay = context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+
+    def visible(self, screen):
+        # What read_pane keeps of a capture: non-blank lines that are not UI chrome.
+        return "\n".join(
+            line for line in screen.splitlines()
+            if line.strip() and not self.relay.CHROME_RE.search(line)
+        )
+
+    def test_detects_the_request_in_real_captures(self):
+        cases = {
+            "permission-read-2.1.4": ("→ Read a.txt Path: a.txt", "Always allow"),
+            "permission-bash-2.1.4": ("$ cat c.txt", "Always allow"),
+            "permission-bash-1.19.0": ("# Shell command $ cat c.txt", "Allow always"),
+        }
+        for name, (request, always) in cases.items():
+            with self.subTest(name):
+                screen = self.visible(opencode_screen(name))
+                self.assertEqual(self.relay.detect_opencode_permission(screen), request)
+                self.assertEqual(
+                    self.relay.detect_approval_options(screen), ["Allow once", always, "Reject"]
+                )
+        confirm = self.visible(opencode_screen("always-confirm-1.19.0"))
+        self.assertIsNone(self.relay.detect_opencode_permission(confirm))
+
+    def test_prompt_identity_survives_a_redraw_but_not_a_new_request(self):
+        screen = opencode_screen("permission-read-2.1.4")
+        redrawn = screen.replace("⠙ Read a.txt", "⠹ Read a.txt")
+        next_file = screen.replace("a.txt", "b.txt")
+        first = self.relay.question_prompt_id("pane-1", screen)
+        self.assertEqual(first, self.relay.question_prompt_id("pane-1", redrawn))
+        self.assertNotEqual(first, self.relay.question_prompt_id("pane-1", next_file))
+
+    def test_answers_map_to_arrow_keys_and_enter(self):
+        keys = self.relay.opencode_permission_keys
+        self.assertEqual(keys("Allow once"), ["Enter"])
+        self.assertEqual(keys("allow  ALWAYS"), ["Right", "Enter"])
+        self.assertEqual(keys("Always allow"), ["Right", "Enter"])
+        self.assertEqual(keys("trust, always allow"), ["Right", "Enter"])
+        self.assertEqual(keys("Reject"), ["Right", "Right", "Enter"])
+        self.assertEqual(keys("no"), ["Right", "Right", "Enter"])
+        self.assertIsNone(keys("sure, go ahead"))
+
+    def test_blocked_message_marks_the_interaction(self):
+        screen = opencode_screen("permission-bash-1.19.0")
+        message = self.relay.blocked_message("pane-1", "opencode", "demo", "local", screen)
+        self.assertEqual(message["interaction"], "opencode_permission")
+        self.assertEqual(message["options"], ["Allow once", "Allow always", "Reject"])
+
+    def _answer(self, keys, screens):
+        sent = []
+        reads = iter(screens)
+        with mock.patch.object(self.relay, "_mutate_herdr",
+                               side_effect=lambda *args, remote=None: sent.append(args[3:]) or True), \
+                mock.patch.object(self.relay, "read_pane",
+                                  side_effect=lambda pane_id, remote=None: next(reads)):
+            ok = self.relay.answer_opencode_permission("pane-1", keys, sleep=lambda _s: None)
+        return ok, sent
+
+    def test_always_confirms_opencode_1_19s_second_screen(self):
+        ok, sent = self._answer(
+            ["Right", "Enter"],
+            [opencode_screen("permission-bash-1.19.0"), opencode_screen("always-confirm-1.19.0")],
+        )
+        self.assertTrue(ok)
+        self.assertEqual(sent, [("Right", "Enter"), ("Enter",)])
+
+    def test_always_sends_nothing_more_when_the_dialog_just_closes(self):
+        ok, sent = self._answer(["Right", "Enter"], ["Build · Big Pickle"])
+        self.assertTrue(ok)
+        self.assertEqual(sent, [("Right", "Enter")])
+
+    def test_once_and_reject_never_read_back(self):
+        ok, sent = self._answer(["Enter"], [])
+        self.assertTrue(ok)
+        self.assertEqual(sent, [("Enter",)])
+
+
 class RelayQuestionTests(unittest.TestCase):
     ASK_SCREEN = """
 ╭─ Ask ─╮

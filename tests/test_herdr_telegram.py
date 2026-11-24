@@ -29,7 +29,13 @@ def _telegram_stubs():
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
+    class BotCommand:
+        def __init__(self, command, description):
+            self.command = command
+            self.description = description
+
     telegram.Update = object
+    telegram.BotCommand = BotCommand
     telegram.ForceReply = ForceReply
     telegram.InlineKeyboardButton = InlineKeyboardButton
     telegram.InlineKeyboardMarkup = InlineKeyboardMarkup
@@ -216,6 +222,69 @@ class TelegramSpawnCommandTests(unittest.TestCase):
 
         self.assertIsNone(self._argv())
         self.assertEqual(message.replies, [])
+
+    def test_run_keeps_the_prompt_lines_after_the_command(self):
+        self._spawn_cmd("echo ok")
+        update, ctx, _ = _command("/run@herdr_bot nightly opencode\nreview the auth\nmiddleware")
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertEqual(
+            self._argv(),
+            ["--chat-id", "1", "--text", "/run nightly opencode", "review the auth", "middleware"],
+        )
+
+    def test_spawn_reply_with_a_prompt_is_still_steerable(self):
+        self._spawn_cmd(
+            'echo "Spawned rt-x-1 (opencode) on checkout /w, pane w9:p1. '
+            'Reply to this message to steer it. Prompt sent."'
+        )
+        update, ctx, _ = _command("/run x -- hello")
+
+        asyncio.run(self.telegram.cmd_run(update, ctx))
+
+        self.assertEqual(self.telegram.pending_pane(1, 101), "w9:p1")
+
+
+class TelegramMenuTests(unittest.TestCase):
+    def test_menu_lists_only_answered_commands(self):
+        telegram = loaded_telegram()
+        telegram.SPAWN_CMD = ""
+        names = [command.command for command in telegram.bot_commands()]
+        self.assertIn("esc", names)
+        self.assertIn("help", names)
+        self.assertNotIn("run", names)
+        telegram.SPAWN_CMD = "/bin/true"
+        self.assertIn("run", [command.command for command in telegram.bot_commands()])
+
+    def test_opencode_permission_buttons_send_the_option_label(self):
+        telegram = loaded_telegram()
+        telegram.CHAT_ID = "1"
+        bot = _Bot()
+        app = types.SimpleNamespace(bot=bot)
+
+        asyncio.run(
+            telegram.notify_blocked(
+                app,
+                pane_id="pane-1",
+                agent="opencode",
+                project="demo",
+                prompt="Permission required",
+                options=["Allow once", "Allow always", "Reject"],
+                prompt_id="abc",
+                interaction="opencode_permission",
+            )
+        )
+
+        markup = bot.sent[0]["reply_markup"]
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        self.assertEqual(
+            [button.text for button in buttons],
+            ["Allow once", "Allow always", "Reject", "Open output & reply"],
+        )
+        data = telegram.parse_callback_data(buttons[1].callback_data)
+        self.assertEqual(data.get("i"), "1")
+        self.assertNotIn("k", data)
 
 
 if __name__ == "__main__":

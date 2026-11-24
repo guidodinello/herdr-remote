@@ -306,6 +306,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         await tg.cmd_agents(update, SimpleNamespace(args=[]))
 
         self.assertIn("DONE:", update.message.replies[0][0])
+        button = update.message.replies[0][1]["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(tg.parse_callback_data(button.callback_data)["action"], "select_reply")
         bot = FakeBot()
         app = SimpleNamespace(bot=bot)
         tg.prev_statuses["w0:p1"] = "working"
