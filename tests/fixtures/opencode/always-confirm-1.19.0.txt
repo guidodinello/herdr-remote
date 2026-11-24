@@ -1,0 +1,24 @@
+
+  ┃
+  ┃  Use the bash tool to run: cat c.txt
+  ┃
+
+     + Thought: 133ms
+
+     $ cat c.txt
+
+     ▣  Build · Big Pickle
+
+  ┃
+  ┃  △ Always allow
+  ┃
+  ┃  This will allow the following patterns until OpenCode is
+  ┃  restarted
+  ┃
+  ┃  - cat *
+  ┃
+  ┃
+  ┃   Confirm   Cancel
+  ┃
+  ┃  ⇆ select  enter confirm
+  ┃

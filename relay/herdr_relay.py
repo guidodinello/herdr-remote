@@ -154,6 +154,30 @@ REMOTES = [r.strip() for r in os.environ.get("HERDR_REMOTES", "").split(",") if 
 
 TOOL_OPTIONS = ["yes, single permission", "trust, always allow", "no (tab to edit)"]
 SUBAGENT_OPTIONS = ["approve all pending", "configure individually", "exit (cancel subagents)"]
+# opencode's "Permission required" dialog: a horizontal choice moved with the arrow keys and
+# confirmed with Enter ("⇆ select  enter confirm"). It takes no number keys and no typed text,
+# so each answer is a key sequence. Checked live on opencode 1.19.0 and 2.1.4: "Allow once"
+# starts selected, Right moves one option, and the middle option is spelled "Allow always"
+# (1.19) or "Always allow" (2.x).
+OPENCODE_ALWAYS_LABELS = ("Allow always", "Always allow")
+OPENCODE_PERMISSION_KEYS = {
+    "allow once": ["Enter"],
+    "allow always": ["Right", "Enter"],
+    "reject": ["Right", "Right", "Enter"],
+}
+# Typed answers mapped to the dialog's choices: opencode's own labels in either spelling,
+# short phone replies, and the Claude-style labels /trust and older clients send.
+OPENCODE_PERMISSION_ALIASES = {
+    "always allow": "allow always",
+    "once": "allow once", "yes": "allow once", "y": "allow once", "allow": "allow once",
+    "yes, single permission": "allow once",
+    "always": "allow always", "trust": "allow always", "trust, always allow": "allow always",
+    "no": "reject", "n": "reject", "deny": "reject", "no (tab to edit)": "reject",
+}
+# opencode 1.19 follows "Allow always" with a second screen ("This will allow the following
+# patterns until OpenCode is restarted", Confirm / Cancel) whose Confirm starts selected;
+# 2.x applies it directly. The relay presses Enter only when this screen is on display.
+OPENCODE_ALWAYS_CONFIRM_MARKER = "This will allow the following patterns"
 CHROME_RE = re.compile(
     r"^[\s\u2500\u2501\u2550_\u2014\u2502|\u25d4\u25d1\u25d5\u25cf\s]+$"
     r"|Kiro\s[\u00b7\u2022]"
@@ -1536,8 +1560,50 @@ def detect_question(text):
     return None
 
 
+def opencode_always_label(text):
+    """The spelling of opencode's "always" option on screen, or None."""
+    flat = " ".join(text.split())
+    return next((label for label in OPENCODE_ALWAYS_LABELS if label in flat), None)
+
+
+def detect_opencode_permission(text):
+    """The request in opencode's "Permission required" dialog, or None if none is on screen.
+
+    Returns only the dialog's own lines (e.g. "→ Read a.txt Path: a.txt"), whitespace-
+    normalized and stripped of the box border, so the prompt identity built from it does not
+    change when the rest of opencode's screen (spinner, timer, transcript) redraws."""
+    if "Permission required" not in text:
+        return None
+    flat = " ".join(text.split())
+    if "Allow once" not in flat or "Reject" not in flat or opencode_always_label(text) is None:
+        return None
+    lines = text.splitlines()
+    start = max(i for i, line in enumerate(lines) if "Permission required" in line)
+    request = []
+    for line in lines[start + 1:]:
+        if "Allow once" in line:
+            break
+        cleaned = line.strip().strip("│┃|▌").strip()
+        if cleaned:
+            request.append(cleaned)
+    return " ".join(" ".join(request).split())
+
+
+def opencode_permission_options(text):
+    """The dialog's options as opencode spells them on this screen."""
+    return ["Allow once", opencode_always_label(text) or OPENCODE_ALWAYS_LABELS[0], "Reject"]
+
+
+def opencode_permission_keys(text):
+    """The key sequence for a typed answer to opencode's permission dialog, or None."""
+    answer = " ".join(text.lower().split())
+    return OPENCODE_PERMISSION_KEYS.get(OPENCODE_PERMISSION_ALIASES.get(answer, answer))
+
+
 def detect_approval_options(text):
     lower = text.lower()
+    if detect_opencode_permission(text) is not None:
+        return opencode_permission_options(text)
     if "yes, single permission" in lower:
         return TOOL_OPTIONS
     if "approve all pending" in lower:
@@ -1565,6 +1631,10 @@ def custom_editor_active(text):
     )
 
 def question_prompt_id(pane_id, content):
+    permission = detect_opencode_permission(content)
+    if permission is not None:
+        signature = json.dumps({"pane_id": pane_id, "opencode_permission": permission}, sort_keys=True)
+        return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:20]
     question = detect_question(content)
     if not question:
         normalized = " ".join(content.split())
@@ -1591,6 +1661,28 @@ def prompt_matches(pane_id, prompt_id, remote=None):
     return question_prompt_id(pane_id, read_pane(pane_id, remote=remote)) == prompt_id
 
 
+OPENCODE_CONFIRM_POLLS = 10
+OPENCODE_CONFIRM_POLL_S = 0.2
+
+
+def answer_opencode_permission(pane_id, keys, remote=None, sleep=time.sleep):
+    """Send the keys for one opencode permission answer, then confirm opencode 1.19's
+    "Always allow" screen if it appears. Returns whether every herdr call succeeded."""
+    if not _mutate_herdr("pane", "send-keys", pane_id, *keys, remote=remote):
+        return False
+    if keys != OPENCODE_PERMISSION_KEYS["allow always"]:
+        return True
+    for _ in range(OPENCODE_CONFIRM_POLLS):
+        sleep(OPENCODE_CONFIRM_POLL_S)
+        content = read_pane(pane_id, remote=remote)
+        if OPENCODE_ALWAYS_CONFIRM_MARKER in " ".join(content.split()):
+            # Confirm starts selected on that screen.
+            return _mutate_herdr("pane", "send-keys", pane_id, "Enter", remote=remote)
+        if detect_opencode_permission(content) is None:
+            return True  # opencode 2.x: the dialog closed without a confirm step
+    return True
+
+
 def blocked_message(pane_id, agent, project, host, content):
     question = detect_question(content) if agent == "omp" else None
     options = detect_options(content) if agent == "omp" else detect_approval_options(content)
@@ -1609,7 +1701,11 @@ def blocked_message(pane_id, agent, project, host, content):
             if option["multi"] and option["label"] != QUESTION_OTHER
             and "Done selecting" not in option["label"] and option["checked"]
         ] if question else [],
-        "interaction": "omp_question" if question else "prompt",
+        "interaction": (
+            "omp_question" if question
+            else "opencode_permission" if detect_opencode_permission(content) is not None
+            else "prompt"
+        ),
         "multi": bool(question and question["multi"]),
         "update": False,
     }
@@ -2196,6 +2292,24 @@ async def handle_client(ws):
                 content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
                 if question_prompt_id(pane_id, content) != msg.get("prompt_id", ""):
                     await ws.send(json.dumps(command_error("prompt changed; refresh and try again")))
+                    continue
+                if detect_opencode_permission(content) is not None:
+                    # opencode's dialog ignores typed text: translate the answer into the arrow
+                    # keys + Enter that pick it. Anything else is refused, never typed.
+                    keys = opencode_permission_keys(text)
+                    if keys is None:
+                        await ws.send(json.dumps(command_error(
+                            "reply with one of: " + ", ".join(opencode_permission_options(content)))))
+                        continue
+                    log.info("Permission answer from %s (%s): pane=%s text=%r keys=%s",
+                             ip, device, pane_id, text, keys)
+                    audit("respond", ip, device, pane_id, f"text={text!r} keys={keys}")
+                    delivered = await asyncio.to_thread(
+                        answer_opencode_permission, pane_id, keys, remote=remote
+                    )
+                    await ws.send(json.dumps(
+                        {"type": "command_result", "command": "respond", "ok": bool(delivered),
+                         **({"request_id": request_id} if request_id else {})}))
                     continue
                 question = (
                     detect_question(content)
