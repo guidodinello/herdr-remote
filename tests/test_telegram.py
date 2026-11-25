@@ -5,6 +5,8 @@
 # ///
 import asyncio
 import ast
+import html
+import re
 import importlib
 import json
 import os
@@ -19,6 +21,7 @@ sys.path.insert(0, str(ROOT / "relay"))
 os.environ.setdefault("HERDR_TG_TOKEN", "test-token")
 
 tg = importlib.import_module("herdr_telegram")
+REAL_FETCH_LAST_MESSAGE = tg.fetch_last_message
 
 
 def make_agents(count, *, status="idle", project="project"):
@@ -120,8 +123,19 @@ def make_active_approval_keyboard(pane_id, options):
     return markup
 
 
+def telegram_length(markup):
+    """What Telegram counts against its 4096 limit: the text after tags and entities are parsed,
+    in UTF-16 units."""
+    plain = html.unescape(re.sub(r"<[^>]+>", "", markup))
+    return len(plain.encode("utf-16-le")) // 2
+
+
 class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        # No test here may open a socket to a relay that might really be running on this machine.
+        patcher = patch.object(tg, "fetch_last_message", AsyncMock(return_value=None))
+        self.fetch_last_message = patcher.start()
+        self.addCleanup(patcher.stop)
         self.old_chat_id = tg.CHAT_ID
         tg.CHAT_ID = "42"
         tg.agents = []
@@ -357,6 +371,148 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["parse_mode"], "HTML")
         self.assertIn("<pre>a &lt;b&gt; &amp; c</pre>", text)
         self.assertTrue(text.endswith("Reply to this message to send your response."))
+
+    def test_a_long_message_is_split_not_truncated_and_stays_inside_telegrams_limit(self):
+        # `<` escapes to `&lt;` (4 chars in the markup, 1 to Telegram); an emoji is 2 UTF-16 units.
+        rows = [f"{index:04d} <tag> & \U0001F353 " + "x" * 60 for index in range(400)]
+        content = "\n".join(rows)
+
+        messages = tg.pane_messages(content, "project", "Reply to this message to send your response.")
+
+        self.assertGreater(len(messages), 1)
+        for message in messages:
+            self.assertLessEqual(telegram_length(message), tg.TELEGRAM_MESSAGE_LIMIT)
+            self.assertIn("<pre>", message)
+        # Nothing is lost: the pre blocks, unescaped and joined, are the whole message.
+        bodies = [html.unescape(re.search(r"<pre>(.*?)</pre>", m, re.S).group(1)) for m in messages]
+        self.assertEqual("\n".join(bodies), content)
+        self.assertTrue(messages[0].startswith("project:"))
+        self.assertTrue(messages[-1].endswith("Reply to this message to send your response."))
+        self.assertNotIn("project:", "".join(messages[1:]))
+        self.assertNotIn("Reply to this message", "".join(messages[:-1]))
+
+    def test_a_single_line_over_the_limit_is_cut_inside_the_line(self):
+        content = "\U0001F353" * 5000  # 10000 UTF-16 units, no newline to split on
+
+        messages = tg.pane_messages(content)
+
+        self.assertGreater(len(messages), 2)
+        for message in messages:
+            self.assertLessEqual(telegram_length(message), tg.TELEGRAM_MESSAGE_LIMIT)
+        joined = "".join(html.unescape(re.search(r"<pre>(.*?)</pre>", m, re.S).group(1)) for m in messages)
+        self.assertEqual(joined, content)
+
+    async def test_read_shows_an_opencode_agents_whole_last_message_in_order(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1)
+        long_answer = "\n".join(f"line {index} <b>" for index in range(1200))
+        self.fetch_last_message.return_value = long_answer
+        callback = FakeCallback({"action": "read", "pane_id": "w0:p1"})
+
+        with patch.object(tg, "read_pane", AsyncMock(return_value="screen tail")) as read_pane:
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        read_pane.assert_not_awaited()
+        replies = callback.message.replies
+        self.assertGreater(len(replies), 1)
+        bodies = [html.unescape(re.search(r"<pre>(.*?)</pre>", text, re.S).group(1)) for text, _, _ in replies]
+        self.assertEqual("\n".join(bodies), long_answer)
+        for text, kwargs, sent in replies:
+            self.assertLessEqual(telegram_length(text), tg.TELEGRAM_MESSAGE_LIMIT)
+            self.assertEqual(kwargs["parse_mode"], "HTML")
+            self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
+
+    async def test_read_falls_back_to_the_screen_tail_when_there_is_no_message(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1)
+        self.fetch_last_message.return_value = None
+        callback = FakeCallback({"action": "read", "pane_id": "w0:p1"})
+
+        with patch.object(tg, "read_pane", AsyncMock(return_value="screen tail")):
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        self.assertEqual(len(callback.message.replies), 1)
+        self.assertIn("<pre>screen tail</pre>", callback.message.replies[0][0])
+
+    async def test_reply_prompt_for_a_long_message_puts_the_input_box_and_footer_on_the_last_part(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1)
+        self.fetch_last_message.return_value = "\n".join("z" * 100 for _ in range(200))
+        callback = FakeCallback({"action": "select_reply", "pane_id": "w0:p1"})
+
+        await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        replies = callback.message.replies
+        self.assertGreater(len(replies), 1)
+        for text, kwargs, sent in replies[:-1]:
+            self.assertNotIn("reply_markup", kwargs)
+            self.assertNotIn("Reply to this message", text)
+            self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
+        text, kwargs, sent = replies[-1]
+        self.assertIsInstance(kwargs["reply_markup"], tg.ForceReply)
+        self.assertTrue(text.endswith("Reply to this message to send your response."))
+        self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
+
+    async def test_fetch_last_message_returns_the_relays_text(self):
+        agent = make_agents(1)[0]
+        preamble = [{"type": "sessions", "sources": []}, {"type": "agents", "agents": []}]
+        connection = FakeRelayConnection(preamble)
+
+        async def recv():
+            if connection.responses_left:
+                return json.dumps(connection.responses_left.pop(0))
+            request = connection.sent[0]
+            return json.dumps({"type": "last_message", "pane_id": request["pane_id"],
+                               "request_id": request["request_id"], "text": "the answer",
+                               "unavailable": None})
+        connection.responses_left = list(preamble)
+        connection.recv = recv
+
+        with patch("websockets.connect", return_value=connection):
+            text = await REAL_FETCH_LAST_MESSAGE(agent)
+
+        self.assertEqual(text, "the answer")
+        self.assertEqual(connection.sent[0]["type"], "last_message")
+        self.assertEqual(connection.sent[0]["pane_id"], "w0:p1")
+
+    async def test_fetch_last_message_says_nothing_when_the_relay_cannot(self):
+        agent = make_agents(1)[0]
+        for reply in ({"unavailable": "service-stopped", "text": ""},
+                      {"unavailable": None, "text": "   "},
+                      {"unavailable": None, "text": None}):
+            connection = FakeRelayConnection([])
+
+            async def recv(reply=reply, connection=connection):
+                request = connection.sent[0]
+                return json.dumps({"type": "last_message", "request_id": request["request_id"], **reply})
+            connection.recv = recv
+            with patch("websockets.connect", return_value=connection):
+                self.assertIsNone(await REAL_FETCH_LAST_MESSAGE(agent), reply)
+
+    async def test_fetch_last_message_is_silent_on_an_older_relay_and_on_errors(self):
+        agent = make_agents(1)[0]
+        # An older relay ignores the request type: only the preamble ever arrives, then silence.
+        silent = FakeRelayConnection([])
+
+        async def never():
+            await asyncio.sleep(3600)
+        silent.recv = never
+        with patch.object(tg, "LAST_MESSAGE_TIMEOUT", 0.05), \
+             patch("websockets.connect", return_value=silent):
+            self.assertIsNone(await REAL_FETCH_LAST_MESSAGE(agent))
+        with patch("websockets.connect", side_effect=OSError("refused")):
+            self.assertIsNone(await REAL_FETCH_LAST_MESSAGE(agent))
+
+    async def test_fetch_last_message_is_not_attempted_where_the_screen_is_the_answer(self):
+        cases = [
+            {**make_agents(1)[0], "agent": "claude"},
+            {**make_agents(1)[0], "status": "blocked"},
+            {**make_agents(1)[0], "status": "working"},
+        ]
+        for agent in cases:
+            with patch("websockets.connect") as connect:
+                self.assertIsNone(await REAL_FETCH_LAST_MESSAGE(agent), agent)
+            connect.assert_not_called()
 
     def test_tidy_pane_keeps_the_answer_above_opencode_2s_tall_footer(self):
         # A finished opencode 2 agent as `herdr pane read` returned it (Pi, 2026-11-24): the

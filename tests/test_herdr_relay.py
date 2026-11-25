@@ -279,7 +279,8 @@ class RelayActivityLedgerTests(unittest.TestCase):
         """`focus` moves herdr's own cursor at the desk without the client reading anything, and the
         tab/workspace verbs name no pane at all."""
         self.assertLessEqual(
-            {"read_pane", "get_history", "respond", "send_keys", "send_text", "agent_prompt"},
+            {"read_pane", "get_history", "last_message", "respond", "send_keys", "send_text",
+             "agent_prompt"},
             set(relay_seen_on()))
         for absent in ("focus", "create_tab", "rename_tab", "close_tab", "rename_agent",
                        "push_subscribe", "push_unsubscribe", "agents"):
@@ -2530,6 +2531,49 @@ class RelayPaneFieldTests(unittest.TestCase):
                          [("user", "does this work?"), ("assistant", "it does")])
         self.assertEqual(payload["total"], 2)
         self.assertFalse(payload["has_more"])
+
+    def test_last_message_asks_the_reader_off_the_loop_and_echoes_the_request_id(self):
+        pane_id = "w0:p1"
+        session = {"agent": "opencode", "kind": "id", "value": "ses_abcdefgh1234"}
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            relay.agent_cache[pane_id] = {"pane_id": pane_id, "agent": "opencode"}
+            relay.pane_session_map[pane_id] = session
+            ws = _FakeWebSocket([json.dumps(
+                {"type": "last_message", "pane_id": pane_id, "request_id": "r1"})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay.transcript, "opencode_last_message",
+                                   return_value={"text": "whole answer", "unavailable": None}) as read:
+                asyncio.run(relay.handle_client(ws))
+            read.assert_called_once()
+            self.assertEqual(read.call_args.args, (session,))
+            self.assertEqual(read.call_args.kwargs["agent"], "opencode")
+            self.assertEqual(
+                json.loads(ws.sent[0]),
+                {"type": "last_message", "pane_id": pane_id, "text": "whole answer",
+                 "unavailable": None, "request_id": "r1"})
+
+    def test_last_message_on_a_remote_pane_is_unavailable_and_runs_nothing(self):
+        pane_id = "w0:p1"
+        with loaded_relay() as relay:
+            relay.known_panes.add(pane_id)
+            relay.pane_remote_map[pane_id] = "pi"
+            ws = _FakeWebSocket([json.dumps({"type": "last_message", "pane_id": pane_id})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay.transcript, "opencode_last_message") as read:
+                asyncio.run(relay.handle_client(ws))
+            read.assert_not_called()
+            self.assertEqual(json.loads(ws.sent[0]),
+                             {"type": "last_message", "pane_id": pane_id, "text": "", "unavailable": "remote"})
+
+    def test_last_message_for_an_unknown_pane_is_an_error(self):
+        with loaded_relay() as relay:
+            ws = _FakeWebSocket([json.dumps({"type": "last_message", "pane_id": "w9:p9"})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay.transcript, "opencode_last_message") as read:
+                asyncio.run(relay.handle_client(ws))
+            read.assert_not_called()
+            self.assertEqual(json.loads(ws.sent[0]), {"type": "error", "message": "unknown pane_id"})
 
     def test_get_history_refuses_a_nonsense_cursor_type(self):
         pane_id = "w0:p1"

@@ -68,6 +68,14 @@ SPAWN_ERROR_TAIL = 500
 # message to steer it." The pane id is what makes that reply steerable.
 SPAWNED_PANE_RE = re.compile(r", pane ([A-Za-z0-9:_-]+)\. Reply to this message")
 PANE_READ_TIMEOUT = 20
+# The relay shells out to opencode for this (a status call, then an api call), and falling back to
+# the screen is cheap, so give up sooner than a pane read.
+LAST_MESSAGE_TIMEOUT = 12
+# Telegram rejects a message over 4096 characters, counted in UTF-16 units after entities are
+# parsed (so `&lt;` counts 1, an emoji 2). Chunks stay well under it; heading and footer come out
+# of the same budget.
+TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_LIMIT_MARGIN = 96
 # How many rows of the pane to ask the relay for, and how many non-blank lines of them to show.
 # A TUI's input box and footer are tall (opencode 2's is ~8 rows, with blank rows around it), so
 # the old 15 raw rows held only chrome and pushed the agent's last answer out of view.
@@ -174,6 +182,105 @@ def pane_html(content: str, project: str | None = None, footer: str | None = Non
     return "\n\n".join(parts)
 
 
+def utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def split_for_telegram(text: str, budget: int) -> list[str]:
+    """Split `text` into chunks of at most `budget` UTF-16 units, on line boundaries where it can
+    and inside a line only when that one line alone is over budget. Nothing is dropped:
+    "\n".join(chunks) is `text`, except a hard cut inside a line which joins with no separator."""
+    chunks: list[str] = []
+    current: list[str] = []
+    used = 0
+
+    def flush():
+        nonlocal current, used
+        if current:
+            chunks.append("\n".join(current))
+        current, used = [], 0
+
+    for line in text.split("\n"):
+        while utf16_len(line) > budget:
+            flush()
+            cut, units = 0, 0
+            for char in line:
+                width = utf16_len(char)
+                if units + width > budget:
+                    break
+                units += width
+                cut += 1
+            chunks.append(line[:cut])
+            line = line[cut:]
+        cost = utf16_len(line) + 1
+        if current and used + cost > budget:
+            flush()
+        current.append(line)
+        used += cost
+    flush()
+    return chunks or [""]
+
+
+def pane_messages(content: str, project: str | None = None, footer: str | None = None) -> list[str]:
+    """`pane_html` for content of any length: one message per chunk, the project heading on the
+    first and the footer on the last."""
+    overhead = utf16_len(project or "") + utf16_len(footer or "") + TELEGRAM_LIMIT_MARGIN
+    chunks = split_for_telegram(content, TELEGRAM_MESSAGE_LIMIT - overhead)
+    last = len(chunks) - 1
+    return [
+        pane_html(chunk, project if index == 0 else None, footer if index == last else None)
+        for index, chunk in enumerate(chunks)
+    ]
+
+
+async def fetch_last_message(agent: dict) -> str | None:
+    """An opencode agent's whole last answer, from the relay, or None when the screen should be
+    shown instead: not opencode, mid-turn or waiting on a prompt (a permission question lives on
+    the screen, not in the message list), an older relay that ignores the request, or any failure.
+    Never raises and never surfaces why."""
+    if agent.get("agent") != "opencode" or agent.get("status") in ("blocked", "working"):
+        return None
+    import websockets
+    request_id = secrets.token_hex(8)
+    try:
+        async with websockets.connect(RELAY_WS) as ws:
+            await ws.send(json.dumps({
+                "type": "last_message", "pane_id": agent["pane_id"], "request_id": request_id,
+            }))
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + LAST_MESSAGE_TIMEOUT
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
+                if msg.get("type") == "error" and msg.get("request_id") in (None, request_id):
+                    return None
+                if msg.get("type") == "last_message" and msg.get("request_id") == request_id:
+                    text = msg.get("text")
+                    return text if isinstance(text, str) and text.strip() and not msg.get("unavailable") else None
+    except Exception as exc:
+        log.info("last message unavailable for %s: %s", agent.get("pane_id"), scrub(exc))
+        return None
+
+
+async def agent_output(agent: dict, screen_limit: int) -> str:
+    """What to show of an agent: its whole last answer when the relay can give it, else the
+    screen tail (its last `screen_limit` characters, as before)."""
+    message = await fetch_last_message(agent)
+    if message is not None:
+        return message
+    content = await read_pane(agent["pane_id"])
+    return content[-screen_limit:] if len(content) > screen_limit else content
+
+
+async def send_pane_output(message, chat_id: int, pane_id: str, content: str, project: str | None = None):
+    """Reply with `content` as one or more code-block messages, each one steerable by replying."""
+    for text in pane_messages(content, project):
+        sent = await message.reply_text(text, parse_mode="HTML")
+        register_pending(chat_id, sent.message_id, pane_id)
+
+
 async def read_pane(pane_id: str, lines: int = PANE_READ_WINDOW) -> str:
     """Read pane content from relay: the last PANE_SHOW_LINES non-blank lines of `lines` rows."""
     import websockets
@@ -251,17 +358,21 @@ async def send_reply_prompt(message, chat, agent: dict, content: str | None = No
     project = agent.get("project") or agent.get("agent") or "agent"
     footer = "Reply to this message to send your response."
     if content is None:
-        text = f"{html.escape(project)}:\n\n{html.escape(footer)}"
+        texts = [f"{html.escape(project)}:\n\n{html.escape(footer)}"]
     else:
-        text = pane_html(content, project, footer)
+        texts = pane_messages(content, project, footer)
     kwargs = {"parse_mode": "HTML"}
-    if getattr(chat, "type", None) == "private":
-        kwargs["reply_markup"] = ForceReply(
-            selective=True,
-            input_field_placeholder=f"Reply to {project}"[:64],
-        )
-    sent = await message.reply_text(text, **kwargs)
-    register_pending(chat.id, sent.message_id, agent["pane_id"])
+    sent = None
+    for index, text in enumerate(texts):
+        extra = {}
+        # The input box follows the LAST message, which is also the one with the footer.
+        if index == len(texts) - 1 and getattr(chat, "type", None) == "private":
+            extra["reply_markup"] = ForceReply(
+                selective=True,
+                input_field_placeholder=f"Reply to {project}"[:64],
+            )
+        sent = await message.reply_text(text, **kwargs, **extra)
+        register_pending(chat.id, sent.message_id, agent["pane_id"])
     return sent
 
 
@@ -604,11 +715,8 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No agent matching '{query}'. Use /agents to see list.")
         return
 
-    content = await read_pane(match["pane_id"])
-    if len(content) > 3500:
-        content = content[-3500:]
-    msg = await update.message.reply_text(pane_html(content, match["project"]), parse_mode="HTML")
-    register_pending(update.effective_chat.id, msg.message_id, match["pane_id"])
+    content = await agent_output(match, 3500)
+    await send_pane_output(update.message, update.effective_chat.id, match["pane_id"], content, match["project"])
 
 
 async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -691,9 +799,7 @@ async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No agent matching '{query}'.")
         return
 
-    content = await read_pane(match["pane_id"])
-    if len(content) > 3000:
-        content = content[-3000:]
+    content = await agent_output(match, 3000)
     await send_reply_prompt(update.message, update.effective_chat, match, content)
 
 
@@ -790,11 +896,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     if action == "read":
-        content = await read_pane(data["pane_id"])
-        if len(content) > 3500:
-            content = content[-3500:]
-        msg = await query.message.reply_text(pane_html(content), parse_mode="HTML")
-        register_pending(update.effective_chat.id, msg.message_id, data["pane_id"])
+        content = await agent_output(selected_agent, 3500)
+        await send_pane_output(query.message, update.effective_chat.id, data["pane_id"], content)
         return
 
     if action == "interrupt":
@@ -811,9 +914,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "select_reply":
-        content = await read_pane(data["pane_id"])
-        if len(content) > 3000:
-            content = content[-3000:]
+        content = await agent_output(selected_agent, 3000)
         await send_reply_prompt(query.message, update.effective_chat, selected_agent, content)
         return
 
