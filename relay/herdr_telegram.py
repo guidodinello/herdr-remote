@@ -145,6 +145,17 @@ async def send_keys_to_relay(pane_id: str, keys: list[str], prompt_id: str | Non
         await await_command_result(ws, request_id, "send_keys")
 
 
+def interrupt_keys(agent: dict) -> tuple[list[str], str]:
+    """The keys that interrupt `agent`'s running turn, and their label for the reply.
+
+    opencode 2 takes Escape twice (`esc interrupt` -> `esc again to interrupt`; verified on the Pi,
+    2026-11-24: the agent stays alive and settles `done`). Ctrl+C quits its TUI instead, which
+    deletes the agent. Everything else keeps Ctrl+C."""
+    if agent.get("agent") == "opencode":
+        return ["Escape", "Escape"], "Esc Esc"
+    return ["C-c"], "Ctrl+C"
+
+
 def tidy_pane(content: str, keep: int = PANE_SHOW_LINES) -> str:
     """The last `keep` non-blank lines of a pane read, trailing spaces trimmed."""
     shown = [line.rstrip() for line in content.splitlines() if line.strip()]
@@ -480,7 +491,7 @@ Commands
 /reply [name] - show an agent's output and reply
 /send <name> <text> - send text to an agent
 /read [name] - recent terminal output
-/esc [name] - interrupt an agent (Ctrl+C)
+/esc [name] - interrupt an agent (Esc Esc for opencode, else Ctrl+C)
 /trust [name] - always-allow a blocked agent's prompt
 /status - relay connection
 /digest - today's activity"""
@@ -601,7 +612,7 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /interrupt [project] — send Ctrl+C."""
+    """Handle /interrupt [project] — interrupt the agent (see interrupt_keys)."""
     args = ctx.args
     if not args:
         if not agents:
@@ -624,8 +635,9 @@ async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await send_keys_to_relay(match["pane_id"], ["C-c"])
-        await update.message.reply_text(f"Sent Ctrl+C to {match['project']}")
+        keys, label = interrupt_keys(match)
+        await send_keys_to_relay(match["pane_id"], keys)
+        await update.message.reply_text(f"Sent {label} to {match['project']}")
     except Exception as e:
         await update.message.reply_text(f"Failed: {scrub(e)}")
 
@@ -787,8 +799,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "interrupt":
         try:
-            await send_keys_to_relay(data["pane_id"], ["C-c"])
-            await query.message.reply_text("Sent Ctrl+C")
+            keys, label = interrupt_keys(selected_agent)
+            await send_keys_to_relay(data["pane_id"], keys)
+            await query.message.reply_text(f"Sent {label}")
         except Exception as e:
             await query.message.reply_text(f"Failed: {scrub(e)}")
         return
