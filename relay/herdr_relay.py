@@ -142,7 +142,7 @@ ACTIVITY_FLUSH_DEBOUNCE = 10.0
 # own cursor at the desk without the client reading anything, and `seen` is about what YOU looked
 # at through the relay. So are the tab/workspace verbs, which name no pane.
 SEEN_ON = frozenset({
-    "read_pane", "get_history", "respond", "send_keys", "send_text", "agent_prompt",
+    "read_pane", "get_history", "last_message", "respond", "send_keys", "send_text", "agent_prompt",
     "question_toggle", "question_submit",
 })
 
@@ -2455,6 +2455,31 @@ async def handle_client(ws):
                     log=log,
                 )
                 await ws.send(json.dumps({"type": "history", "pane_id": pane_id, **body}))
+            elif msg_type == "last_message":
+                # An opencode agent's whole last answer, for clients that would otherwise show the
+                # screen tail. Additive: an older relay ignores the type, so a client treats
+                # silence as "unavailable". `unavailable` says why there is no text; every reason
+                # means "show the screen instead" and none is an error to surface.
+                pane_id = msg["pane_id"]
+                request_id = msg.get("request_id")
+                if pane_id not in known_panes:
+                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    continue
+                if pane_remote_map.get(pane_id):
+                    body = {"text": "", "unavailable": "remote"}
+                else:
+                    pane = agent_cache.get(pane_id) or {}
+                    # `opencode service status` + `opencode api` are subprocesses: off the loop.
+                    body = await asyncio.to_thread(
+                        transcript.opencode_last_message,
+                        pane_session_map.get(pane_id),
+                        agent=pane.get("agent", ""),
+                        log=log,
+                    )
+                reply = {"type": "last_message", "pane_id": pane_id, **body}
+                if request_id:
+                    reply["request_id"] = request_id
+                await ws.send(json.dumps(reply))
             elif msg_type == "send_keys":
                 pane_id = msg["pane_id"]
                 request_id = msg.get("request_id")

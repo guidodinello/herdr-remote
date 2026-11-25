@@ -610,7 +610,7 @@ Messages are JSON with a `type` field:
 **Server → Client:** `agents` (complete state snapshot, plus the `spaces` hierarchy), `agent_update` (single-pane state merge), `blocked` (approval prompt), `pane_content` (terminal read), `sessions` (per-source herdr session lists and the active selection), `history` (transcript turns, or `unavailable` with a reason), `command_result` / `tab_created` (did the mutation land), `error`
 **Server → Client:** `agents` (complete state snapshot, plus the `spaces` hierarchy and the `panes` list), `agent_update` (single-pane state merge), `blocked` (approval prompt), `pane_content` (terminal read), `history` (transcript turns, or `unavailable` with a reason), `command_result` / `tab_created` (did the mutation land), `error`
 
-**Client → Server:** `respond` (send text to agent), `read_pane` (request terminal content), `send_keys` (send key sequences), `send_text` (raw text without newline), `agent_prompt` (submit free-form text via `herdr agent prompt`), `session_switch` (point one source at a herdr session; `session: null` follows herdr's default), `get_history`, `focus`, `create_tab`, `rename_tab`, `close_tab`, `rename_agent`, `push_subscribe`/`push_unsubscribe`
+**Client → Server:** `respond` (send text to agent), `read_pane` (request terminal content), `send_keys` (send key sequences), `send_text` (raw text without newline), `agent_prompt` (submit free-form text via `herdr agent prompt`), `session_switch` (point one source at a herdr session; `session: null` follows herdr's default), `get_history`, `last_message`, `focus`, `create_tab`, `rename_tab`, `close_tab`, `rename_agent`, `push_subscribe`/`push_unsubscribe`
 
 An `agents` entry carries, per pane: `pane_id`, `agent`, `label`, `workspace_label`, `title` (herdr's terminal title —
 live activity, not a session name: a working claude sets it to what it is doing, and
@@ -846,6 +846,29 @@ appeared for the people on a tunnel.
     reason rather than "no history for this pane". `file_truncated` means only the tail of the file
     was read (a remote host, or a file past `HERDR_TRANSCRIPT_MAX_BYTES`) — say so instead of
     implying the conversation starts there.
+
+- **`last_message` returns an opencode agent's whole last answer, and says why when it cannot.**
+  Request `{pane_id, request_id?}`; reply `{type: "last_message", pane_id, request_id?, text,
+  unavailable}` with `unavailable` ∈ `null | disabled | unsupported | no-session | no-binary |
+  service-stopped | remote | empty | error`. Every non-null reason means "show the screen instead"
+  and is not an error to surface; an older relay ignores the type, so a client must treat silence
+  as the same thing (the Telegram bot waits 12s). Only opencode, only local panes, and the bot
+  asks only while the agent is not `blocked`/`working`, because a permission prompt lives on the
+  screen, not in the message list.
+  - **`opencode api` starts opencode's background service when it is stopped** — in the caller's
+    cgroup and environment, with no provider keys, dying with the calling unit — and so does
+    `opencode session export` (verified on 2.1.4: `service status` flips from `stopped` to a URL
+    after it). `api --server <url>` is refused ("requires a password"; the secret is in
+    `service.json`, which the relay must not read). So the reader runs `opencode service status`
+    first, read-only, and calls `api session.message.list` only when it prints a URL. A service
+    stopping between those two calls is a tiny race the relay accepts.
+  - The binary is resolved by `PATH`, then `~/.opencode/bin/opencode` (the Pi unit's `PATH` lacks
+    it). The session id is the `ses_…` ref herdr announces in `agent_session` (kind `id`), checked
+    against `^ses_[A-Za-z0-9]{8,64}$` before it reaches an argv.
+  - `session.message.list` comes **newest first** (2.1.4); the reader does not rely on that and
+    takes the assistant entry with the greatest `time.created` that has a `text` block, joining
+    its `text` blocks and dropping `reasoning`. If the newest page holds only tool-only
+    assistant entries, there is no text and the bot shows the screen.
 
 ### herdr read semantics the relay is built on (live-probed on herdr 0.8.0 / protocol 19; re-probed on 0.8.2 where a bullet says so)
 

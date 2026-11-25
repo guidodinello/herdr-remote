@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 
@@ -854,3 +855,108 @@ def _load_remote(value, parse, remote, ssh_args, remote_runner):
     parsed = (turns, title, file_truncated)
     cache_put(key, (size,), parsed)
     return parsed
+
+
+# ---------------------------------------------------------------------------- opencode last message
+#
+# opencode keeps no JSONL on disk we can tail; its messages are served by its background service.
+# `opencode api` STARTS that service when it is stopped -- in the caller's cgroup and environment,
+# with no provider keys, dying with the calling unit -- so the relay must never be what starts it.
+# `opencode session export` does the same (verified on 2.1.4: status flips from `stopped` to a URL
+# after it), and `api --server <url>` is refused with "requires a password". What is left is to ask
+# `opencode service status` first (read-only: a URL when running, `stopped` otherwise) and only call
+# `api` when it answers with a URL. A service stopping between those two calls is a tiny race that
+# herdr-routines accepts too.
+
+OPENCODE_SESSION_RE = re.compile(r"\Ases_[A-Za-z0-9]{8,64}\Z")
+OPENCODE_BIN_FALLBACK = os.path.expanduser("~/.opencode/bin/opencode")
+OPENCODE_TIMEOUT = 10
+
+
+def resolve_opencode():
+    """The opencode binary: PATH first, then ~/.opencode/bin (it is not on the Pi unit's PATH)."""
+    found = shutil.which("opencode")
+    if found:
+        return found
+    if os.path.isfile(OPENCODE_BIN_FALLBACK) and os.access(OPENCODE_BIN_FALLBACK, os.X_OK):
+        return OPENCODE_BIN_FALLBACK
+    return None
+
+
+def opencode_service_running(binary, run=subprocess.run):
+    """True only when `opencode service status` prints a URL. Read-only; `stopped` is False."""
+    result = run([binary, "service", "status"], capture_output=True, text=True,
+                 timeout=OPENCODE_TIMEOUT)
+    if result.returncode != 0:
+        return False
+    first = (result.stdout or "").strip().splitlines()[:1]
+    return bool(first) and first[0].startswith(("http://", "https://"))
+
+
+def parse_opencode_last_message(payload):
+    """The text of the newest assistant message in a `session.message.list` payload, or None.
+
+    The list comes newest-first (2.1.4) but the order is not relied on: the newest is the one with
+    the greatest time.created. All `text` blocks of it are joined; `reasoning` blocks are not part
+    of the answer. An assistant entry with no text (a tool-only step) is skipped, so the last
+    message that SAID something is what comes back. Anything unexpected is None, never an error."""
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return None
+    best_created, best_text = None, None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        content = entry.get("content")
+        if not isinstance(content, list):
+            continue
+        texts = [b["text"] for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"
+                 and isinstance(b.get("text"), str) and b["text"].strip()]
+        if not texts:
+            continue
+        created = (entry.get("time") or {}).get("created")
+        if isinstance(created, bool) or not isinstance(created, (int, float)):
+            created = -1
+        if best_created is None or created > best_created:
+            best_created, best_text = created, "\n\n".join(texts).strip()
+    return best_text
+
+
+def opencode_last_message(session, agent="", run=subprocess.run, log=None):
+    """`{text, unavailable}` for a pane's last opencode answer. Never raises.
+
+    `unavailable` is None on success, else why not: no-session, unsupported (not opencode),
+    no-binary, service-stopped, empty, error. Every one of them means "show the screen instead"."""
+    def fail(reason):
+        return {"text": "", "unavailable": reason}
+
+    if not ENABLED:
+        return fail("disabled")
+    ref = session if isinstance(session, dict) else {}
+    if (ref.get("agent") or agent) != "opencode":
+        return fail("unsupported")
+    value = ref.get("value")
+    if ref.get("kind") != "id" or not isinstance(value, str) or not OPENCODE_SESSION_RE.match(value):
+        return fail("no-session")
+    binary = resolve_opencode()
+    if not binary:
+        return fail("no-binary")
+    try:
+        if not opencode_service_running(binary, run):
+            return fail("service-stopped")
+        result = run([binary, "api", "session.message.list", "--param", f"sessionID={value}"],
+                     capture_output=True, text=True, timeout=OPENCODE_TIMEOUT)
+        if result.returncode != 0:
+            # Every fallback is silent to the user, so this is the only trace of why: a unit
+            # environment that differs from a shell (PATH, auth) shows up here and nowhere else.
+            if log:
+                stderr = ((result.stderr or "").strip().splitlines() or [""])[0][:200]
+                log.info("opencode api exited %s for %s: %s", result.returncode, value, stderr)
+            return fail("error")
+        text = parse_opencode_last_message(json.loads(result.stdout))
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        if log:
+            log.info("opencode last message failed for %s: %s", value, exc)
+        return fail("error")
+    return {"text": text, "unavailable": None} if text else fail("empty")

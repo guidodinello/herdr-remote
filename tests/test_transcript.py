@@ -709,5 +709,173 @@ class PiTests(unittest.TestCase):
         self.assertEqual(body["unavailable"], "no-session")
 
 
+
+OPENCODE_FIXTURE = (Path(__file__).resolve().parent / "fixtures" / "opencode"
+                    / "session-message-list-2.1.4.json")
+OPENCODE_SESSION = "ses_def94d1d3ffe8k5XUBcChHw4Kh"
+
+
+class FakeOpencode:
+    """Stands in for subprocess.run: records every argv, answers `service status` and `api`."""
+
+    def __init__(self, status="http://127.0.0.1:1234\n", api_stdout=None, api_code=0):
+        self.status = status
+        self.api_stdout = api_stdout if api_stdout is not None else OPENCODE_FIXTURE.read_text()
+        self.api_code = api_code
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[1:3] == ["service", "status"]:
+            return mock.Mock(returncode=0, stdout=self.status)
+        return mock.Mock(returncode=self.api_code, stdout=self.api_stdout)
+
+
+class OpencodeLastMessageTests(unittest.TestCase):
+    """`opencode api` starts opencode's background service when it is stopped, in the caller's
+    cgroup and environment, so every path that is not "service already running" must answer
+    without ever invoking it."""
+
+    SESSION = {"agent": "opencode", "kind": "id", "value": OPENCODE_SESSION}
+
+    def setUp(self):
+        patcher = mock.patch.object(transcript, "resolve_opencode", return_value="/fake/opencode")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def last(self, runner, session=None, agent="opencode"):
+        return transcript.opencode_last_message(
+            self.SESSION if session is None else session, agent=agent, run=runner)
+
+    def test_a_captured_payload_gives_the_whole_answer_without_the_reasoning(self):
+        runner = FakeOpencode()
+        result = self.last(runner)
+        self.assertIsNone(result["unavailable"])
+        text = result["text"]
+        self.assertTrue(text.startswith("1. Blorple\n2. Snargleberry"))
+        self.assertTrue(text.endswith("they all sound delicious."))
+        self.assertEqual(text.count("\n"), 31)  # all 30 rows, not a tail
+        self.assertNotIn("The user wants", text)  # the `reasoning` block is not the answer
+
+    def test_it_asks_status_first_then_issues_only_the_read_only_call(self):
+        runner = FakeOpencode()
+        self.last(runner)
+        self.assertEqual(runner.calls, [
+            ["/fake/opencode", "service", "status"],
+            ["/fake/opencode", "api", "session.message.list", "--param", f"sessionID={OPENCODE_SESSION}"],
+        ])
+
+    def test_a_stopped_service_falls_back_and_never_invokes_api(self):
+        runner = FakeOpencode(status="stopped\n")
+        result = self.last(runner)
+        self.assertEqual(result, {"text": "", "unavailable": "service-stopped"})
+        self.assertEqual(runner.calls, [["/fake/opencode", "service", "status"]])
+
+    def test_a_failing_status_call_is_a_stopped_service(self):
+        failing = mock.Mock(return_value=mock.Mock(returncode=1, stdout=""))
+        result = transcript.opencode_last_message(self.SESSION, agent="opencode", run=failing)
+        self.assertEqual(result["unavailable"], "service-stopped")
+        self.assertEqual(failing.call_count, 1)  # status only; `api` is never reached
+
+    def test_other_agents_never_reach_opencode(self):
+        for session, agent in (({"agent": "claude", "kind": "id", "value": SESSION}, "claude"),
+                               (None, "pi")):
+            runner = FakeOpencode()
+            result = self.last(runner, session=session or {}, agent=agent)
+            self.assertEqual(result["unavailable"], "unsupported")
+            self.assertEqual(runner.calls, [])
+
+    def test_a_missing_or_malformed_session_id_falls_back_without_a_subprocess(self):
+        bad_sessions = [
+            None, {}, {"agent": "opencode"},
+            {"agent": "opencode", "kind": "path", "value": "/tmp/x"},
+            {"agent": "opencode", "kind": "id", "value": ""},
+            {"agent": "opencode", "kind": "id", "value": "ses_x; rm -rf /"},
+            {"agent": "opencode", "kind": "id", "value": "../ses_abcdefgh"},
+            {"agent": "opencode", "kind": "id", "value": 7},
+        ]
+        for session in bad_sessions:
+            runner = FakeOpencode()
+            result = transcript.opencode_last_message(session, agent="opencode", run=runner)
+            self.assertEqual(result["unavailable"], "no-session", session)
+            self.assertEqual(runner.calls, [], session)
+
+    def test_a_missing_binary_falls_back(self):
+        runner = FakeOpencode()
+        with mock.patch.object(transcript, "resolve_opencode", return_value=None):
+            result = self.last(runner)
+        self.assertEqual(result["unavailable"], "no-binary")
+        self.assertEqual(runner.calls, [])
+
+    def test_a_failing_api_call_or_a_timeout_falls_back(self):
+        self.assertEqual(self.last(FakeOpencode(api_code=1))["unavailable"], "error")
+
+        def times_out(argv, **kwargs):
+            raise transcript.subprocess.TimeoutExpired(argv, 10)
+        self.assertEqual(self.last(times_out)["unavailable"], "error")
+
+    def test_a_failing_api_call_leaves_a_trace_in_the_log(self):
+        class Failing(FakeOpencode):
+            def __call__(self, argv, **kwargs):
+                result = super().__call__(argv, **kwargs)
+                if argv[1] == "api":
+                    result.stderr = "Server requires a password\nsecond line"
+                return result
+        log = mock.Mock()
+        result = transcript.opencode_last_message(
+            self.SESSION, agent="opencode", run=Failing(api_code=1), log=log)
+        self.assertEqual(result["unavailable"], "error")
+        rendered = log.info.call_args.args[0] % log.info.call_args.args[1:]
+        self.assertIn("exited 1", rendered)
+        self.assertIn("Server requires a password", rendered)
+        self.assertNotIn("second line", rendered)
+
+    def test_malformed_payloads_fall_back_instead_of_raising(self):
+        valid = json.loads(OPENCODE_FIXTURE.read_text())
+        no_assistant = {"data": [m for m in valid["data"] if m["type"] != "assistant"]}
+        no_text = {"data": [dict(m, content=[b for b in m["content"] if b["type"] != "text"])
+                            if m["type"] == "assistant" else m for m in valid["data"]]}
+        cases = {
+            "not json": "<html>502</html>",
+            "empty": "",
+            "a list": "[]",
+            "no data": json.dumps({"cursor": {}}),
+            "data not a list": json.dumps({"data": "x"}),
+            "no assistant": json.dumps(no_assistant),
+            "assistant without text blocks": json.dumps(no_text),
+            "content not a list": json.dumps({"data": [{"type": "assistant", "content": "hi"}]}),
+        }
+        for name, payload in cases.items():
+            result = self.last(FakeOpencode(api_stdout=payload))
+            self.assertNotEqual(result["unavailable"], None, name)
+            self.assertEqual(result["text"], "", name)
+
+    def test_the_newest_answer_wins_whatever_order_the_list_comes_in(self):
+        def entry(created, *texts):
+            return {"type": "assistant", "time": {"created": created},
+                    "content": [{"type": "text", "text": t} for t in texts]}
+        tool_step = {"type": "assistant", "time": {"created": 9}, "content": [{"type": "tool"}]}
+        entries = [entry(1, "first"), entry(5, "newest, part one", "part two"), entry(3, "middle"),
+                   tool_step]
+        for ordered in (entries, list(reversed(entries))):
+            self.assertEqual(transcript.parse_opencode_last_message({"data": ordered}),
+                             "newest, part one\n\npart two")
+
+    def test_resolve_opencode_prefers_path_then_the_opencode_bin_directory(self):
+        transcript_real = load_transcript()
+        with tempfile.TemporaryDirectory() as home:
+            fallback = Path(home) / "opencode"
+            fallback.write_text("#!/bin/sh\n")
+            fallback.chmod(0o755)
+            with mock.patch.object(transcript_real, "OPENCODE_BIN_FALLBACK", str(fallback)):
+                with mock.patch.object(transcript_real.shutil, "which", return_value=None):
+                    self.assertEqual(transcript_real.resolve_opencode(), str(fallback))
+                with mock.patch.object(transcript_real.shutil, "which", return_value="/usr/bin/opencode"):
+                    self.assertEqual(transcript_real.resolve_opencode(), "/usr/bin/opencode")
+                fallback.chmod(0o644)
+                with mock.patch.object(transcript_real.shutil, "which", return_value=None):
+                    self.assertIsNone(transcript_real.resolve_opencode())
+
+
 if __name__ == "__main__":
     unittest.main()
