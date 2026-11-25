@@ -344,6 +344,53 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["reply_markup"].input_field_placeholder, "Reply to project")
         self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
 
+    async def test_reply_prompt_sends_the_screen_as_an_html_code_block(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1)
+        button = tg.build_agent_keyboard("select_reply").inline_keyboard[0][0]
+        callback = FakeCallback(button.callback_data)
+
+        with patch.object(tg, "read_pane", AsyncMock(return_value="a <b> & c")):
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        text, kwargs, _sent = callback.message.replies[0]
+        self.assertEqual(kwargs["parse_mode"], "HTML")
+        self.assertIn("<pre>a &lt;b&gt; &amp; c</pre>", text)
+        self.assertTrue(text.endswith("Reply to this message to send your response."))
+
+    def test_tidy_pane_keeps_the_answer_above_opencode_2s_tall_footer(self):
+        # A finished opencode 2 agent as `herdr pane read` returned it (Pi, 2026-11-24): the
+        # answer sits above ~8 rows of input box and footer, with blank rows between. The old
+        # last-15-raw-rows read held only the footer and lost "PONG.".
+        screen = "\n".join([
+            "", "  \u2503", "  \u2503  Reply with exactly: PONG. Do not read or edit any files.",
+            "  \u2503", "     PONG.", "     Build \u00b7 Big Pickle \u00b7 2.3s \u00b7 500.0 tok/s",
+            "", "", "  \u2503", "", "  \u2503", "", "  \u2503",
+            "  \u2503  Build \u00b7 Big Pickle Default / OpenCode", "  \u2579" + "\u2580" * 20,
+            "  \u2026/worktr\u2026/herdr-routines/auto-spawn:auto/spawn  11.3K (6%)  ctrl+p commands", "",
+        ])
+
+        shown = tg.tidy_pane(screen)
+
+        self.assertIn("PONG.", shown)
+        self.assertIn("Reply with exactly: PONG.", shown)
+        self.assertNotIn("\n\n", shown)  # blank rows are gone
+
+    def test_tidy_pane_keeps_only_the_last_lines_and_never_returns_empty_text(self):
+        screen = "\n".join(f"line {i}" for i in range(100))
+        shown = tg.tidy_pane(screen, keep=3)
+        self.assertEqual(shown, "line 97\nline 98\nline 99")
+        self.assertEqual(tg.tidy_pane(" \n\n  "), "(empty)")
+
+    async def test_read_pane_asks_for_a_wide_window_and_tidies_the_reply(self):
+        connection = FakeRelayConnection([{"type": "pane_content", "content": "\n\nanswer\n\n\nfooter\n"}])
+
+        with patch("websockets.connect", return_value=connection):
+            content = await tg.read_pane("w0:p1")
+
+        self.assertEqual(connection.sent[0]["lines"], tg.PANE_READ_WINDOW)
+        self.assertEqual(content, "answer\nfooter")
+
     async def test_stale_selection_offers_refresh(self):
         tg.relay_connected = True
         callback = FakeCallback({"action": "select_reply", "pane_id": "gone:pane"})
