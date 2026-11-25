@@ -422,6 +422,57 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         send_to_relay.assert_not_awaited()
         self.assertIn("no longer available", callback.message.replies[0][0].lower())
 
+    async def test_interrupt_button_sends_escape_twice_to_an_opencode_agent(self):
+        # Ctrl+C quits opencode 2's TUI and deletes the agent; Esc Esc interrupts the turn and
+        # leaves the agent alive (verified live on the Pi, 2026-11-24).
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="working")
+        button = tg.build_agent_keyboard("interrupt", agent_list=tg.agents).inline_keyboard[0][0]
+        callback = FakeCallback(button.callback_data)
+
+        with patch.object(tg, "send_keys_to_relay", AsyncMock()) as send_keys:
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        send_keys.assert_awaited_once_with("w0:p1", ["Escape", "Escape"])
+        self.assertEqual(callback.message.replies[0][0], "Sent Esc Esc")
+
+    async def test_interrupt_button_keeps_ctrl_c_for_other_agents(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="working")
+        tg.agents[0]["agent"] = "claude"
+        button = tg.build_agent_keyboard("interrupt", agent_list=tg.agents).inline_keyboard[0][0]
+        callback = FakeCallback(button.callback_data)
+
+        with patch.object(tg, "send_keys_to_relay", AsyncMock()) as send_keys:
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        send_keys.assert_awaited_once_with("w0:p1", ["C-c"])
+        self.assertEqual(callback.message.replies[0][0], "Sent Ctrl+C")
+
+    async def test_esc_with_a_name_uses_the_agents_interrupt_keys(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="working")
+        update = make_update()
+
+        with patch.object(tg, "send_keys_to_relay", AsyncMock()) as send_keys:
+            await tg.cmd_interrupt(update, SimpleNamespace(args=["project"]))
+
+        send_keys.assert_awaited_once_with("w0:p1", ["Escape", "Escape"])
+        self.assertEqual(update.message.replies[0][0], "Sent Esc Esc to project")
+
+    def test_escape_is_a_key_the_relay_allows(self):
+        # interrupt_keys sends it, so the relay allowlist must accept it as a bare key.
+        relay = ROOT / "relay" / "herdr_relay.py"
+        tree = ast.parse(relay.read_text(encoding="utf-8"))
+        safe_keys = {
+            const.value
+            for node in tree.body
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "SAFE_KEYS" for t in node.targets)
+            for const in ast.walk(node.value)
+            if isinstance(const, ast.Constant)
+        }
+        self.assertIn("Escape", safe_keys)
+
     async def test_stale_approval_cannot_type_into_unblocked_agent(self):
         tg.relay_connected = True
         tg.agents = make_agents(1, status="blocked")
