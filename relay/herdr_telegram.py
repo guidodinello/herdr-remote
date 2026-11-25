@@ -4,7 +4,7 @@
 # dependencies = ["python-telegram-bot>=21.0", "websockets>=14.0"]
 # ///
 """herdr-remote Telegram bot — monitor and approve agents from Telegram."""
-import asyncio, hashlib, json, os, logging, re, secrets
+import asyncio, hashlib, html, json, os, logging, re, secrets
 from collections import Counter, OrderedDict
 
 from telegram import BotCommand, ForceReply, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -68,6 +68,11 @@ SPAWN_ERROR_TAIL = 500
 # message to steer it." The pane id is what makes that reply steerable.
 SPAWNED_PANE_RE = re.compile(r", pane ([A-Za-z0-9:_-]+)\. Reply to this message")
 PANE_READ_TIMEOUT = 20
+# How many rows of the pane to ask the relay for, and how many non-blank lines of them to show.
+# A TUI's input box and footer are tall (opencode 2's is ~8 rows, with blank rows around it), so
+# the old 15 raw rows held only chrome and pushed the agent's last answer out of view.
+PANE_READ_WINDOW = 160
+PANE_SHOW_LINES = 40
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
 STATUS_LABELS = {"blocked": "BLOCKED", "working": "WORKING", "done": "DONE", "idle": "IDLE", "unknown": "IDLE"}
 ACTION_CODES = {
@@ -140,8 +145,26 @@ async def send_keys_to_relay(pane_id: str, keys: list[str], prompt_id: str | Non
         await await_command_result(ws, request_id, "send_keys")
 
 
-async def read_pane(pane_id: str, lines: int = 15) -> str:
-    """Read pane content from relay."""
+def tidy_pane(content: str, keep: int = PANE_SHOW_LINES) -> str:
+    """The last `keep` non-blank lines of a pane read, trailing spaces trimmed."""
+    shown = [line.rstrip() for line in content.splitlines() if line.strip()]
+    return "\n".join(shown[-keep:]) or "(empty)"
+
+
+def pane_html(content: str, project: str | None = None, footer: str | None = None) -> str:
+    """Telegram HTML for an agent's screen: the text in a code block so the TUI's spacing and
+    box drawing survive, with an optional project heading and footer line."""
+    parts = []
+    if project:
+        parts.append(f"{html.escape(project)}:")
+    parts.append(f"<pre>{html.escape(content)}</pre>")
+    if footer:
+        parts.append(html.escape(footer))
+    return "\n\n".join(parts)
+
+
+async def read_pane(pane_id: str, lines: int = PANE_READ_WINDOW) -> str:
+    """Read pane content from relay: the last PANE_SHOW_LINES non-blank lines of `lines` rows."""
     import websockets
     try:
         async with websockets.connect(RELAY_WS) as ws:
@@ -158,7 +181,7 @@ async def read_pane(pane_id: str, lines: int = 15) -> str:
                 raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
                 msg = json.loads(raw)
                 if msg.get("type") == "pane_content":
-                    return msg.get("content", "(empty)")
+                    return tidy_pane(msg.get("content", ""))
     except Exception as e:
         return f"(error reading pane: {scrub(e)})"
 
@@ -215,17 +238,18 @@ def clear_relay_connection_state():
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
     project = agent.get("project") or agent.get("agent") or "agent"
-    parts = [f"{project}:"]
-    if content is not None:
-        parts.extend(["", content])
-    parts.extend(["", "Reply to this message to send your response."])
-    kwargs = {}
+    footer = "Reply to this message to send your response."
+    if content is None:
+        text = f"{html.escape(project)}:\n\n{html.escape(footer)}"
+    else:
+        text = pane_html(content, project, footer)
+    kwargs = {"parse_mode": "HTML"}
     if getattr(chat, "type", None) == "private":
         kwargs["reply_markup"] = ForceReply(
             selective=True,
             input_field_placeholder=f"Reply to {project}"[:64],
         )
-    sent = await message.reply_text("\n".join(parts), **kwargs)
+    sent = await message.reply_text(text, **kwargs)
     register_pending(chat.id, sent.message_id, agent["pane_id"])
     return sent
 
@@ -572,7 +596,7 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     content = await read_pane(match["pane_id"])
     if len(content) > 3500:
         content = content[-3500:]
-    msg = await update.message.reply_text(f"{match['project']}:\n\n{content}")
+    msg = await update.message.reply_text(pane_html(content, match["project"]), parse_mode="HTML")
     register_pending(update.effective_chat.id, msg.message_id, match["pane_id"])
 
 
@@ -757,7 +781,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         content = await read_pane(data["pane_id"])
         if len(content) > 3500:
             content = content[-3500:]
-        msg = await query.message.reply_text(f"{content}")
+        msg = await query.message.reply_text(pane_html(content), parse_mode="HTML")
         register_pending(update.effective_chat.id, msg.message_id, data["pane_id"])
         return
 
